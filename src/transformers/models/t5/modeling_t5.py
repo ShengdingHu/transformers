@@ -286,12 +286,12 @@ class T5DenseActDense(nn.Module):
         self.dropout = nn.Dropout(config.dropout_rate)
         self.act = ACT2FN[config.dense_act_fn]
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, last_ids=None):
         hidden_states = self.wi(hidden_states)
         hidden_states = self.act(hidden_states)
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.wo(hidden_states)
-        return hidden_states
+        return hidden_states, last_ids
 
 
 class T5DenseGatedActDense(nn.Module):
@@ -303,13 +303,13 @@ class T5DenseGatedActDense(nn.Module):
         self.dropout = nn.Dropout(config.dropout_rate)
         self.act = ACT2FN[config.dense_act_fn]
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, last_ids=None):
         hidden_gelu = self.act(self.wi_0(hidden_states))
         hidden_linear = self.wi_1(hidden_states)
         hidden_states = hidden_gelu * hidden_linear
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.wo(hidden_states)
-        return hidden_states
+        return hidden_states, last_ids
 
 
 class T5LayerFF(nn.Module):
@@ -323,11 +323,11 @@ class T5LayerFF(nn.Module):
         self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, last_ids=None):
         forwarded_states = self.layer_norm(hidden_states)
-        forwarded_states = self.DenseReluDense(forwarded_states)
+        forwarded_states, _ = self.DenseReluDense(forwarded_states, last_ids)
         hidden_states = hidden_states + self.dropout(forwarded_states)
-        return hidden_states
+        return hidden_states, last_ids
 
 
 class T5Attention(nn.Module):
@@ -446,6 +446,7 @@ class T5Attention(nn.Module):
         query_length=None,
         use_cache=False,
         output_attentions=False,
+        last_ids=None,
     ):
         """
         Self-attention (if key_value_states is None) or attention over source sentence (provided by key_value_states).
@@ -548,6 +549,8 @@ class T5Attention(nn.Module):
 
         if output_attentions:
             outputs = outputs + (attn_weights,)
+
+        outputs = outputs + (last_ids,)
         return outputs
 
 
@@ -567,6 +570,7 @@ class T5LayerSelfAttention(nn.Module):
         past_key_value=None,
         use_cache=False,
         output_attentions=False,
+        last_ids=None,
     ):
         normed_hidden_states = self.layer_norm(hidden_states)
         attention_output = self.SelfAttention(
@@ -577,6 +581,7 @@ class T5LayerSelfAttention(nn.Module):
             past_key_value=past_key_value,
             use_cache=use_cache,
             output_attentions=output_attentions,
+            last_ids=last_ids,
         )
         hidden_states = hidden_states + self.dropout(attention_output[0])
         outputs = (hidden_states,) + attention_output[1:]  # add attentions if we output them
@@ -601,6 +606,7 @@ class T5LayerCrossAttention(nn.Module):
         use_cache=False,
         query_length=None,
         output_attentions=False,
+        last_ids = None,
     ):
         normed_hidden_states = self.layer_norm(hidden_states)
         attention_output = self.EncDecAttention(
@@ -613,6 +619,7 @@ class T5LayerCrossAttention(nn.Module):
             use_cache=use_cache,
             query_length=query_length,
             output_attentions=output_attentions,
+            last_ids = last_ids,
         )
         layer_output = hidden_states + self.dropout(attention_output[0])
         outputs = (layer_output,) + attention_output[1:]  # add attentions if we output them
@@ -644,6 +651,7 @@ class T5Block(nn.Module):
         use_cache=False,
         output_attentions=False,
         return_dict=True,
+        last_ids=None,
     ):
 
         if past_key_value is not None:
@@ -671,7 +679,9 @@ class T5Block(nn.Module):
             past_key_value=self_attn_past_key_value,
             use_cache=use_cache,
             output_attentions=output_attentions,
+            last_ids=last_ids
         )
+        self_attention_outputs = self_attention_outputs[:-1]
         hidden_states, present_key_value_state = self_attention_outputs[:2]
         attention_outputs = self_attention_outputs[2:]  # Keep self-attention outputs and relative position weights
 
@@ -699,7 +709,9 @@ class T5Block(nn.Module):
                 query_length=query_length,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
+                last_ids=last_ids
             )
+            cross_attention_outputs = cross_attention_outputs[:-1]
             hidden_states = cross_attention_outputs[0]
 
             # clamp inf values to enable fp16 training
@@ -715,7 +727,8 @@ class T5Block(nn.Module):
             attention_outputs = attention_outputs + cross_attention_outputs[2:]
 
         # Apply Feed Forward layer
-        hidden_states = self.layer[-1](hidden_states)
+        # from IPython import embed; embed(header="730")
+        hidden_states, _ = self.layer[-1](hidden_states, last_ids=last_ids)
 
         # clamp inf values to enable fp16 training
         if hidden_states.dtype == torch.float16 and torch.isinf(hidden_states).any():
@@ -951,6 +964,15 @@ class T5Stack(T5PreTrainedModel):
                 batch_size, encoder_seq_length, device=inputs_embeds.device, dtype=torch.long
             )
 
+        if self.is_decoder:
+            # last_ids = None
+            if attention_mask is None:
+                last_ids = torch.zeros(batch_size, dtype=torch.long, device=inputs_embeds.device) -1
+            else:
+                last_ids = torch.argmin(attention_mask, dim=-1) - 1
+        else:
+            last_ids = None
+
         # initialize past_key_values with `None` if past does not exist
         if past_key_values is None:
             past_key_values = [None] * len(self.block)
@@ -1044,6 +1066,7 @@ class T5Stack(T5PreTrainedModel):
                     past_key_value=past_key_value,
                     use_cache=use_cache,
                     output_attentions=output_attentions,
+                    last_ids=last_ids,
                 )
 
             # layer_outputs is a tuple with:
