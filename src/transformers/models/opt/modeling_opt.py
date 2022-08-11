@@ -14,17 +14,21 @@
 # limitations under the License.
 """ PyTorch OPT model."""
 import random
+from turtle import forward
 from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss
+from torch import functional as F
 
 from ...activations import ACT2FN
 from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from ...modeling_utils import PreTrainedModel
 from ...utils import (
+    DUMMY_INPUTS,
+    DUMMY_MASK,
     add_code_sample_docstrings,
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
@@ -96,7 +100,7 @@ class OPTLearnedPositionalEmbedding(nn.Embedding):
         self.offset = 2
         super().__init__(num_embeddings + self.offset, embedding_dim)
 
-    def forward(self, attention_mask: torch.LongTensor, past_key_values_length: int = 0):
+    def forward(self, attention_mask: torch.LongTensor, past_key_values_length: int = 0, last_ids: Optional[torch.Tensor] = None):
         """`input_ids_shape` is expected to be [bsz x seqlen]."""
         attention_mask = attention_mask.long()
 
@@ -150,6 +154,7 @@ class OPTAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
+        last_ids: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
 
@@ -261,6 +266,13 @@ class OPTAttention(nn.Module):
 
         return attn_output, attn_weights_reshaped, past_key_value
 
+class LastTokenLinear(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.fc = nn.Linear(in_dim, out_dim)
+    def forward(self, input: torch.Tensor, last_ids: torch.Tensor=None) -> Tuple:
+        # from IPython import embed; embed(header="in LastTokenLinear.")
+        return (self.fc(input), last_ids)
 
 class OPTDecoderLayer(nn.Module):
     def __init__(self, config: OPTConfig):
@@ -279,8 +291,10 @@ class OPTDecoderLayer(nn.Module):
         self.activation_dropout = config.activation_dropout
 
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
-        self.fc1 = nn.Linear(self.embed_dim, config.ffn_dim)
-        self.fc2 = nn.Linear(config.ffn_dim, self.embed_dim)
+        self.fc1 = LastTokenLinear(self.embed_dim, config.ffn_dim)
+        self.fc2 = LastTokenLinear(config.ffn_dim, self.embed_dim)
+        # self.fc1 = nn.Linear(self.embed_dim, config.ffn_dim)
+        # self.fc2 = nn.Linear(config.ffn_dim, self.embed_dim)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
 
     def forward(
@@ -291,6 +305,7 @@ class OPTDecoderLayer(nn.Module):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        last_ids: Optional[torch.Tensor] = None
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
@@ -331,17 +346,24 @@ class OPTDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states_shape = hidden_states.shape
+        # from IPython import embed; embed(header="line 348, in modeling_opt.py")
         hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))
         residual = hidden_states
 
         # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
         if self.do_layer_norm_before:
             hidden_states = self.final_layer_norm(hidden_states)
-
-        hidden_states = self.fc1(hidden_states)
+        hidden_states, _ = self.fc1(hidden_states.reshape(hidden_states_shape[0], hidden_states_shape[1], -1), last_ids)    # input a 3d tensor, output a 3d tensor
+        # from IPython import embed; embed(header='line 357, in modeling_opt')
+        if hidden_states.dim() == 3:
+            hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))
         hidden_states = self.activation_fn(hidden_states)
 
-        hidden_states = self.fc2(hidden_states)
+        # from IPython import embed; embed(header='line 360, in modeling_opt')
+
+        hidden_states, _ = self.fc2(hidden_states.reshape(hidden_states_shape[0], hidden_states_shape[1], -1), last_ids)
+        if hidden_states.dim() == 3:
+            hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
 
         hidden_states = (residual + hidden_states).view(hidden_states_shape)
@@ -357,6 +379,9 @@ class OPTDecoderLayer(nn.Module):
 
         if use_cache:
             outputs += (present_key_value,)
+
+        outputs += (last_ids,)
+
 
         return outputs
 
@@ -389,6 +414,16 @@ class OPTPreTrainedModel(PreTrainedModel):
     _no_split_modules = ["OPTDecoderLayer"]
     _keys_to_ignore_on_load_unexpected = [r"decoder\.version"]
 
+    @property
+    def dummy_inputs(self):
+        input_ids = torch.tensor(DUMMY_INPUTS)
+        input_mask = torch.tensor(DUMMY_MASK)
+        dummy_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": input_mask,
+        }
+        return dummy_inputs
+    
     def _init_weights(self, module):
         std = self.config.init_std
         if isinstance(module, nn.Linear):
@@ -547,6 +582,7 @@ class OPTDecoder(OPTPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        last_ids: Optional[torch.Tensor] = None
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         r"""
         Args:
@@ -680,6 +716,7 @@ class OPTDecoder(OPTPreTrainedModel):
                     attention_mask,
                     head_mask[idx] if head_mask is not None else None,
                     None,
+                    last_ids=last_ids
                 )
             else:
 
@@ -690,6 +727,7 @@ class OPTDecoder(OPTPreTrainedModel):
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    last_ids=last_ids
                 )
 
             hidden_states = layer_outputs[0]
@@ -712,12 +750,13 @@ class OPTDecoder(OPTPreTrainedModel):
 
         next_cache = next_decoder_cache if use_cache else None
         if not return_dict:
-            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, last_ids] if v is not None)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
+            last_ids=last_ids
         )
 
 
@@ -761,6 +800,7 @@ class OPTModel(OPTPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        last_ids: Optional[torch.Tensor] = None
     ) -> Union[Tuple, BaseModelOutputWithPast]:
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -791,6 +831,7 @@ class OPTModel(OPTPreTrainedModel):
             past_key_values=decoder_outputs.past_key_values,
             hidden_states=decoder_outputs.hidden_states,
             attentions=decoder_outputs.attentions,
+            last_ids=last_ids
         )
 
 
@@ -838,6 +879,7 @@ class OPTForCausalLM(OPTPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        last_ids: Optional[torch.Tensor] = None
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -912,6 +954,8 @@ class OPTForCausalLM(OPTPreTrainedModel):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you consciours? Can you talk to me?\nI'm not consciours, but I can talk to you."
         ```"""
+        last_ids = torch.argmin(attention_mask, dim=-1) - 1
+        # from IPython import embed; embed(header="line 926, in modeling_opt.py")
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -930,6 +974,7 @@ class OPTForCausalLM(OPTPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            last_ids = last_ids
         )
 
         logits = self.lm_head(outputs[0]).contiguous()
@@ -953,6 +998,8 @@ class OPTForCausalLM(OPTPreTrainedModel):
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            last_ids=last_ids
+
         )
 
     def prepare_inputs_for_generation(self, input_ids, past=None, attention_mask=None, use_cache=None, **kwargs):

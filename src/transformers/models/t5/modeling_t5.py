@@ -245,7 +245,7 @@ class T5LayerNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, last_ids=None):
 
         # T5 uses a layer_norm which only scales and doesn't shift, which is also known as Root Mean
         # Square Layer Normalization https://arxiv.org/abs/1910.07467 thus varience is calculated
@@ -258,8 +258,8 @@ class T5LayerNorm(nn.Module):
         # convert into half-precision if necessary
         if self.weight.dtype in [torch.float16, torch.bfloat16]:
             hidden_states = hidden_states.to(self.weight.dtype)
-
-        return self.weight * hidden_states
+        # TODO: 把这里加上last_ids才可以传到adapter的post_forward中去
+        return (self.weight * hidden_states, last_ids)
 
 
 try:
@@ -319,15 +319,18 @@ class T5LayerFF(nn.Module):
             self.DenseReluDense = T5DenseGatedActDense(config)
         else:
             self.DenseReluDense = T5DenseActDense(config)
-
+        self.config = config
         self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
 
     def forward(self, hidden_states, last_ids=None):
-        forwarded_states = self.layer_norm(hidden_states)
+        forwarded_states, _ = self.layer_norm(hidden_states, last_ids)
         forwarded_states, _ = self.DenseReluDense(forwarded_states, last_ids)
         hidden_states = hidden_states + self.dropout(forwarded_states)
+        # if self.config.is_decoder and len(last_ids) == 2:
+        #     from IPython import embed; embed(header="328, in T5LayerFF")
         return hidden_states, last_ids
+        # return (hidden_states, ) + (last_ids, )
 
 
 class T5Attention(nn.Module):
@@ -546,11 +549,14 @@ class T5Attention(nn.Module):
 
         present_key_value_state = (key_states, value_states) if (self.is_decoder and use_cache) else None
         outputs = (attn_output,) + (present_key_value_state,) + (position_bias,)
+        # from IPython import embed; embed(header="In 549, T5Attention")
 
         if output_attentions:
             outputs = outputs + (attn_weights,)
 
         outputs = outputs + (last_ids,)
+        # if self.is_decoder:
+        #     from IPython import embed; embed(header="In 555, T5Attention")
         return outputs
 
 
@@ -572,7 +578,7 @@ class T5LayerSelfAttention(nn.Module):
         output_attentions=False,
         last_ids=None,
     ):
-        normed_hidden_states = self.layer_norm(hidden_states)
+        normed_hidden_states, _ = self.layer_norm(hidden_states, last_ids)
         attention_output = self.SelfAttention(
             normed_hidden_states,
             mask=attention_mask,
@@ -608,7 +614,7 @@ class T5LayerCrossAttention(nn.Module):
         output_attentions=False,
         last_ids = None,
     ):
-        normed_hidden_states = self.layer_norm(hidden_states)
+        normed_hidden_states, _ = self.layer_norm(hidden_states, last_ids)
         attention_output = self.EncDecAttention(
             normed_hidden_states,
             mask=attention_mask,
@@ -727,8 +733,9 @@ class T5Block(nn.Module):
             attention_outputs = attention_outputs + cross_attention_outputs[2:]
 
         # Apply Feed Forward layer
-        # from IPython import embed; embed(header="730")
         hidden_states, _ = self.layer[-1](hidden_states, last_ids=last_ids)
+        # if self.is_decoder and len(last_ids) != 3:
+        #     from IPython import embed; embed(header="734")
 
         # clamp inf values to enable fp16 training
         if hidden_states.dtype == torch.float16 and torch.isinf(hidden_states).any():
@@ -742,7 +749,7 @@ class T5Block(nn.Module):
         else:
             outputs = outputs + attention_outputs
 
-        return outputs  # hidden-states, present_key_value_states, (self-attention position bias), (self-attention weights), (cross-attention position bias), (cross-attention weights)
+        return outputs + (last_ids,)  # hidden-states, present_key_value_states, (self-attention position bias), (self-attention weights), (cross-attention position bias), (cross-attention weights)
 
 
 class T5PreTrainedModel(PreTrainedModel):
@@ -918,6 +925,7 @@ class T5Stack(T5PreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        last_ids=None
     ):
         # Model parallel
         if self.model_parallel:
@@ -963,15 +971,20 @@ class T5Stack(T5PreTrainedModel):
             encoder_attention_mask = torch.ones(
                 batch_size, encoder_seq_length, device=inputs_embeds.device, dtype=torch.long
             )
+        # from IPython import embed; embed(header="969")
 
-        if self.is_decoder:
-            # last_ids = None
-            if attention_mask is None:
-                last_ids = torch.zeros(batch_size, dtype=torch.long, device=inputs_embeds.device) -1
-            else:
-                last_ids = torch.argmin(attention_mask, dim=-1) - 1
-        else:
-            last_ids = None
+        # if self.is_decoder:
+            
+        #     last_ids = None
+        #     if attention_mask is None:
+        #         last_ids = torch.zeros(batch_size, dtype=torch.long, device=inputs_embeds.device) -1
+        #     else:
+        #         last_ids = torch.argmin(attention_mask, dim=-1) - 1
+        #     from IPython import embed; embed(header="978")
+            
+        # else:
+        #     last_ids = None
+        
 
         # initialize past_key_values with `None` if past does not exist
         if past_key_values is None:
@@ -1003,6 +1016,8 @@ class T5Stack(T5PreTrainedModel):
         encoder_decoder_position_bias = None
 
         hidden_states = self.dropout(inputs_embeds)
+        # if self.is_decoder:
+        #     from IPython import embed; embed(header="1015")
 
         for i, (layer_module, past_key_value) in enumerate(zip(self.block, past_key_values)):
             layer_head_mask = head_mask[i]
@@ -1052,6 +1067,7 @@ class T5Stack(T5PreTrainedModel):
                     layer_head_mask,
                     cross_attn_layer_head_mask,
                     None,  # past_key_value is always None with gradient checkpointing
+                    last_ids=last_ids
                 )
             else:
                 layer_outputs = layer_module(
@@ -1075,6 +1091,7 @@ class T5Stack(T5PreTrainedModel):
                 layer_outputs = layer_outputs[:1] + (None,) + layer_outputs[1:]
 
             hidden_states, present_key_value_state = layer_outputs[:2]
+            # from IPython import embed; embed(header="In 1085, T5Stack")
 
             # We share the position biases between the layers - the first layer store them
             # layer_outputs = hidden-states, key-value-states (self-attention position bias), (self-attention weights),
@@ -1097,7 +1114,7 @@ class T5Stack(T5PreTrainedModel):
                     if i == v[-1] and "cuda:" + str(k) != self.last_device:
                         hidden_states = hidden_states.to("cuda:" + str(k + 1))
 
-        hidden_states = self.final_layer_norm(hidden_states)
+        hidden_states, _ = self.final_layer_norm(hidden_states)
         hidden_states = self.dropout(hidden_states)
 
         # Add last layer
@@ -1384,6 +1401,7 @@ class T5Model(T5PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        last_ids: Optional[torch.Tensor] = None,
     ) -> Union[Tuple[torch.FloatTensor], Seq2SeqModelOutput]:
         r"""
         Returns:
@@ -1578,6 +1596,7 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        last_ids: Optional[torch.Tensor] = None,
     ) -> Union[Tuple[torch.FloatTensor], Seq2SeqLMOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -1610,6 +1629,13 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         >>> print(tokenizer.decode(outputs[0], skip_special_tokens=True))
         >>> # studies have shown that owning a dog is good for you.
         ```"""
+        # lyf edit     
+        # if decoder_attention_mask is not None:
+        #     last_ids = torch.argmin(decoder_attention_mask, dim=-1) - 1
+            # from IPython import embed; embed(header="In 1633, T5ForConditionalGeneration")
+        # from IPython import embed; embed(header="In 1636, T5ForConditionalGeneration")
+        # lyf edit
+        
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1630,6 +1656,7 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
+                last_ids=last_ids
             )
         elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
             encoder_outputs = BaseModelOutput(
@@ -1672,6 +1699,7 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            last_ids=last_ids
         )
 
         sequence_output = decoder_outputs[0]
@@ -1698,7 +1726,7 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         if not return_dict:
             output = (lm_logits,) + decoder_outputs[1:] + encoder_outputs
             return ((loss,) + output) if loss is not None else output
-
+        # from IPython import embed; embed()
         return Seq2SeqLMOutput(
             loss=loss,
             logits=lm_logits,
@@ -1840,6 +1868,7 @@ class T5EncoderModel(T5PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        last_ids: Optional[torch.Tensor] = None,
     ) -> Union[Tuple[torch.FloatTensor], BaseModelOutput]:
         r"""
         Returns:

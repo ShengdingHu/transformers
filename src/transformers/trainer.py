@@ -1629,6 +1629,7 @@ class Trainer:
 
             step = -1
             for step, inputs in enumerate(epoch_iterator):
+                # from IPython import embed; embed(header="line 1632, in trainer.py")
 
                 # Skip past any already trained steps if resuming training
                 if steps_trained_in_current_epoch > 0:
